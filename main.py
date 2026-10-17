@@ -11,7 +11,7 @@ import ctypes
 import time
 import warnings
 
-# Прицельно глушим ТОЛЬКО шум protobuf из MediaPipe, не трогая прочие UserWarning
+# Прицельно глушим только protobuf-шум из MediaPipe
 warnings.filterwarnings(
     "ignore",
     message=r".*SymbolDatabase\.GetPrototype\(\) is deprecated.*",
@@ -25,19 +25,50 @@ except AttributeError:
     pass
 
 pyautogui.PAUSE = 0
-# КРИТИЧНО: иначе при ведении курсора к (0,0) — например, к кнопке "Пуск" —
-# PyAutoGUI выбросит FailSafeException и скрипт упадёт
-pyautogui.FAILSAFE = False
-
-# Настройки поведения
-DEBUG_OVERLAY        = True   # поставить False для "продакшена" (без скелета и FPS)
-PINCH_RATIO_THRESH   = 0.35   # порог щипка, нормированный на размер ладони
-DRAG_HOLD_TIME       = 0.15   # сколько держать щипок перед тем, как разрешить drag
-DRAG_MOVE_THRESHOLD  = 20     # минимальный сдвиг в пикселях экрана, чтобы стал drag
-HAND_LOST_FRAMES     = 15     # ~0.5 сек при 30 FPS — сколько ждать перед mouseUp
+pyautogui.FAILSAFE = False  # иначе краш при ведении курсора к (0, 0)
 
 
-# --- ONE EURO FILTER ---
+# ============================================================
+# ТУМБЛЕРЫ И ПАРАМЕТРЫ
+# ============================================================
+
+USE_PALM_HYBRID     = True    # гибридный трекинг: ладонь + смещение кончика
+USE_DEAD_ZONE       = True    # мёртвая зона (не двигать курсор от микрошума)
+PRECISION_ON_PINCH  = True    # усиленная фильтрация в момент щипка
+DEBUG_OVERLAY       = True    # скелет, FPS, кружки, статус
+
+# --- Параметры фильтрации ---
+
+# Пальмовый канал: сильно сглажен, отдаёт крупные движения
+PALM_MINCUTOFF   = 0.025
+PALM_BETA        = 0.5
+
+# Канал смещения кончика от ладони: точная наводка, слабо сглажен
+OFFSET_MINCUTOFF = 0.12
+OFFSET_BETA      = 1.2
+
+# Прямой канал (когда USE_PALM_HYBRID=False) — настройки как раньше
+DIRECT_MINCUTOFF = 0.05
+DIRECT_BETA      = 0.8
+
+# Точный режим (на время щипка): почти «кирпич»
+PRECISION_MINCUTOFF = 0.010
+
+# --- Параметры dead zone ---
+DEAD_ZONE_PX = 2.5   # не двигать курсор, если сглаженное смещение < 2.5 px
+
+# --- Параметры жестов ---
+PINCH_RATIO_THRESH  = 0.35   # порог щипка, нормированный на размер ладони
+DRAG_HOLD_TIME      = 0.15   # сколько держать щипок перед разрешением drag
+DRAG_MOVE_THRESHOLD = 20     # минимальный сдвиг в px экрана, чтобы стал drag
+HAND_LOST_FRAMES    = 15     # ~0.5 сек при 30 FPS — буфер потери руки
+REACQUIRE_RESET     = 10     # если рука пропала дольше — сбросить фильтры
+
+
+# ============================================================
+# ONE EURO FILTER
+# ============================================================
+
 class OneEuroFilter:
     def __init__(self, t0, x0, mincutoff=1.0, beta=0.0, dcutoff=1.0):
         self.mincutoff = mincutoff
@@ -51,6 +82,13 @@ class OneEuroFilter:
         tau = 1.0 / (2 * math.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
+    def reset(self, t, x):
+        """Сбросить состояние фильтра в точку x — используется при
+        ре-обнаружении руки, чтобы курсор не «пролетал» дугой из старой позиции."""
+        self.x_prev  = x
+        self.dx_prev = 0.0
+        self.t_prev  = t
+
     def __call__(self, t, x):
         dt = t - self.t_prev
         if dt <= 0:
@@ -59,13 +97,16 @@ class OneEuroFilter:
         edx = self.dx_prev + self.alpha(self.dcutoff, dt) * (dx - self.dx_prev)
         cutoff = self.mincutoff + self.beta * abs(edx)
         rx = self.x_prev + self.alpha(cutoff, dt) * (x - self.x_prev)
-        self.x_prev = rx
+        self.x_prev  = rx
         self.dx_prev = edx
-        self.t_prev = t
+        self.t_prev  = t
         return rx
 
 
-# --- Инициализация MediaPipe ---
+# ============================================================
+# ИНИЦИАЛИЗАЦИЯ MEDIAPIPE
+# ============================================================
+
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     max_num_hands=1,
@@ -76,24 +117,65 @@ mp_draw = mp.solutions.drawing_utils
 
 screen_w, screen_h = pyautogui.size()
 
-# Состояния
+# Фильтры: пальмовый канал
+start_time = time.time()
+filter_palm_x = OneEuroFilter(start_time, screen_w / 2, PALM_MINCUTOFF, PALM_BETA)
+filter_palm_y = OneEuroFilter(start_time, screen_h / 2, PALM_MINCUTOFF, PALM_BETA)
+
+# Фильтры: канал смещения кончика
+filter_off_x  = OneEuroFilter(start_time, 0.0, OFFSET_MINCUTOFF, OFFSET_BETA)
+filter_off_y  = OneEuroFilter(start_time, 0.0, OFFSET_MINCUTOFF, OFFSET_BETA)
+
+# Фильтры: прямой канал (на случай USE_PALM_HYBRID=False)
+filter_dir_x  = OneEuroFilter(start_time, screen_w / 2, DIRECT_MINCUTOFF, DIRECT_BETA)
+filter_dir_y  = OneEuroFilter(start_time, screen_h / 2, DIRECT_MINCUTOFF, DIRECT_BETA)
+
+
+# ============================================================
+# КАМЕРА — 720p60 + свежий кадр (BUFFERSIZE=1)
+# ============================================================
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+cap.set(cv2.CAP_PROP_FPS,          60)
+try:
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # критично против лага
+except Exception:
+    pass
+
+actual_fps = cap.get(cv2.CAP_PROP_FPS)
+print("\nMudra запущен.")
+print(f"Камера: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+      f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {actual_fps:.0f} FPS")
+print(f"Пальмовый гибрид: {'ON' if USE_PALM_HYBRID else 'OFF'}, "
+      f"dead zone: {'ON' if USE_DEAD_ZONE else 'OFF'}, "
+      f"точный режим: {'ON' if PRECISION_ON_PINCH else 'OFF'}")
+print("Короткий щипок — клик. Долгий щипок + сдвиг — перетаскивание.")
+print("ESC — выход.\n")
+
+
+# ============================================================
+# СОСТОЯНИЯ
+# ============================================================
+
 pinch_start_time   = None
 pinch_anchor       = None   # (x, y) на экране — где начался щипок
 pinch_anchor_frame = None   # (x, y) в кадре — для визуализации
 is_dragging        = False
 hand_lost_frames   = 0
 
-# Фильтры
-start_time = time.time()
-filter_x = OneEuroFilter(start_time, screen_w / 2, mincutoff=0.05, beta=0.8)
-filter_y = OneEuroFilter(start_time, screen_h / 2, mincutoff=0.05, beta=0.8)
+# Для dead zone
+last_move_x, last_move_y = screen_w / 2, screen_h / 2
 
-cap = cv2.VideoCapture(0)
-print("\nMudra с поддержкой Drag-and-Drop запущен.")
-print("Короткий щипок — клик. Долгий щипок + сдвиг — перетаскивание.")
-print("Для выхода нажмите ESC в окне видео.\n")
+# Для FPS-счётчика
+fps_smoothed = 0.0
+prev_time    = time.time()
 
-prev_time = time.time()
+
+# ============================================================
+# ОСНОВНОЙ ЦИКЛ
+# ============================================================
 
 while cap.isOpened():
     success, frame = cap.read()
@@ -108,6 +190,7 @@ while cap.isOpened():
     current_time = time.time()
 
     if results.multi_hand_landmarks:
+        was_lost = hand_lost_frames >= REACQUIRE_RESET
         hand_lost_frames = 0
 
         for hand_landmarks in results.multi_hand_landmarks:
@@ -117,13 +200,57 @@ while cap.isOpened():
             wrist        = landmarks[0]
             middle_mcp   = landmarks[9]
 
-            # Сглаживание координат
-            raw_x = index_finger.x * screen_w
-            raw_y = index_finger.y * screen_h
-            smooth_x = filter_x(current_time, raw_x)
-            smooth_y = filter_y(current_time, raw_y)
+            # --- Сырые координаты в пикселях экрана ---
+            palm_x_norm = (landmarks[0].x + landmarks[5].x + landmarks[9].x
+                           + landmarks[13].x + landmarks[17].x) / 5.0
+            palm_y_norm = (landmarks[0].y + landmarks[5].y + landmarks[9].y
+                           + landmarks[13].y + landmarks[17].y) / 5.0
 
-            # Нормируем расстояние на размер ладони — инвариант к дистанции до камеры
+            palm_px_x   = palm_x_norm * screen_w
+            palm_px_y   = palm_y_norm * screen_h
+            offset_px_x = (index_finger.x - palm_x_norm) * screen_w
+            offset_px_y = (index_finger.y - palm_y_norm) * screen_h
+            direct_px_x = index_finger.x * screen_w
+            direct_px_y = index_finger.y * screen_h
+
+            # --- Ре-инициализация фильтров после потери руки ---
+            if was_lost:
+                filter_palm_x.reset(current_time, palm_px_x)
+                filter_palm_y.reset(current_time, palm_px_y)
+                filter_off_x.reset(current_time, offset_px_x)
+                filter_off_y.reset(current_time, offset_px_y)
+                filter_dir_x.reset(current_time, direct_px_x)
+                filter_dir_y.reset(current_time, direct_px_y)
+                last_move_x, last_move_y = direct_px_x, direct_px_y
+
+            # --- Точный режим: усиливаем фильтрацию во время щипка ---
+            in_precision = (PRECISION_ON_PINCH
+                            and pinch_start_time is not None
+                            and not is_dragging)
+            if in_precision:
+                filter_off_x.mincutoff = PRECISION_MINCUTOFF
+                filter_off_y.mincutoff = PRECISION_MINCUTOFF
+                filter_dir_x.mincutoff = PRECISION_MINCUTOFF
+                filter_dir_y.mincutoff = PRECISION_MINCUTOFF
+            else:
+                filter_off_x.mincutoff = OFFSET_MINCUTOFF
+                filter_off_y.mincutoff = OFFSET_MINCUTOFF
+                filter_dir_x.mincutoff = DIRECT_MINCUTOFF
+                filter_dir_y.mincutoff = DIRECT_MINCUTOFF
+
+            # --- Сглаживание и итоговая позиция курсора ---
+            if USE_PALM_HYBRID:
+                palm_s_x = filter_palm_x(current_time, palm_px_x)
+                palm_s_y = filter_palm_y(current_time, palm_px_y)
+                off_s_x  = filter_off_x(current_time, offset_px_x)
+                off_s_y  = filter_off_y(current_time, offset_px_y)
+                smooth_x = palm_s_x + off_s_x
+                smooth_y = palm_s_y + off_s_y
+            else:
+                smooth_x = filter_dir_x(current_time, direct_px_x)
+                smooth_y = filter_dir_y(current_time, direct_px_y)
+
+            # --- Нормированный порог щипка (инвариант к дистанции) ---
             palm_size = math.hypot(
                 (wrist.x - middle_mcp.x) * w,
                 (wrist.y - middle_mcp.y) * h,
@@ -135,25 +262,25 @@ while cap.isOpened():
             pinch_ratio = pinch_dist / max(palm_size, 1e-6)
             is_pinching = pinch_ratio < PINCH_RATIO_THRESH
 
-            # --- СОСТОЯНИЕ: ЩИПОК ---
+            # =============================================
+            # ЛОГИКА ЖЕСТОВ
+            # =============================================
+
             if is_pinching:
                 if pinch_start_time is None:
-                    # Фиксируем якорь — именно здесь произойдёт клик/захват
                     pinch_start_time   = current_time
                     pinch_anchor       = (int(smooth_x), int(smooth_y))
-                    pinch_anchor_frame = (int(index_finger.x * w), int(index_finger.y * h))
-                    # На всякий случай закрываем "зависший" drag с прошлого раза
+                    pinch_anchor_frame = (int(index_finger.x * w),
+                                          int(index_finger.y * h))
                     if is_dragging:
                         pyautogui.mouseUp()
                         is_dragging = False
 
                 duration  = current_time - pinch_start_time
-                move_dist = math.hypot(
-                    smooth_x - pinch_anchor[0],
-                    smooth_y - pinch_anchor[1],
-                )
+                move_dist = math.hypot(smooth_x - pinch_anchor[0],
+                                       smooth_y - pinch_anchor[1])
 
-                # Переход в режим drag: подержали И сдвинули
+                # Drag = подержал + сдвинул
                 if (not is_dragging
                         and duration  > DRAG_HOLD_TIME
                         and move_dist > DRAG_MOVE_THRESHOLD):
@@ -161,65 +288,87 @@ while cap.isOpened():
                     is_dragging = True
 
                 if is_dragging:
-                    # Ведём объект за пальцем
+                    # Ведём объект за пальцем (без dead zone — нужна точность)
                     pyautogui.moveTo(int(smooth_x), int(smooth_y))
+                    last_move_x, last_move_y = smooth_x, smooth_y
                     if DEBUG_OVERLAY:
-                        cv2.circle(frame, pinch_anchor_frame, 20, (255, 0, 0), cv2.FILLED)
+                        cv2.circle(frame, pinch_anchor_frame, 20,
+                                   (255, 0, 0), cv2.FILLED)
                 else:
-                    # Курсор «примёрз» к якорю — щипок ещё не превратился в drag
+                    # Курсор «приморожен» на якоре
                     pyautogui.moveTo(*pinch_anchor)
+                    last_move_x, last_move_y = pinch_anchor
                     if DEBUG_OVERLAY:
-                        cv2.circle(frame, pinch_anchor_frame, 15, (0, 255, 255), cv2.FILLED)
+                        cv2.circle(frame, pinch_anchor_frame, 15,
+                                   (0, 255, 255), cv2.FILLED)
 
-            # --- СОСТОЯНИЕ: НЕ ЩИПОК ---
             else:
-                # В обычном режиме курсор свободно следует за пальцем
+                # Обычный режим — с dead zone
                 if not is_dragging:
-                    pyautogui.moveTo(int(smooth_x), int(smooth_y))
+                    should_move = True
+                    if USE_DEAD_ZONE:
+                        if math.hypot(smooth_x - last_move_x,
+                                      smooth_y - last_move_y) < DEAD_ZONE_PX:
+                            should_move = False
+                    if should_move:
+                        pyautogui.moveTo(int(smooth_x), int(smooth_y))
+                        last_move_x, last_move_y = smooth_x, smooth_y
 
                 if pinch_start_time is not None:
                     if is_dragging:
-                        # Отпускаем перетаскиваемый объект
                         pyautogui.mouseUp()
                         is_dragging = False
                     else:
-                        # Короткий или долгий щипок без сдвига — это клик по якорю
+                        # Клик бьёт строго в точку захвата
                         pyautogui.click(*pinch_anchor)
                         if DEBUG_OVERLAY:
-                            cv2.circle(frame, pinch_anchor_frame, 25, (0, 255, 0), 2)
+                            cv2.circle(frame, pinch_anchor_frame, 25,
+                                       (0, 255, 0), 2)
                     pinch_start_time   = None
                     pinch_anchor       = None
                     pinch_anchor_frame = None
 
             if DEBUG_OVERLAY:
-                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                mp_draw.draw_landmarks(frame, hand_landmarks,
+                                       mp_hands.HAND_CONNECTIONS)
 
     # --- РУКА ПРОПАЛА ---
     else:
         hand_lost_frames += 1
         if hand_lost_frames == 1:
-            # Первый кадр без руки — щипок недействителен
             pinch_start_time   = None
             pinch_anchor       = None
             pinch_anchor_frame = None
-        # Drag держим до последнего: даём шанс вернуть руку в кадр
         if hand_lost_frames >= HAND_LOST_FRAMES and is_dragging:
             pyautogui.mouseUp()
             is_dragging = False
 
-    # --- FPS / оверлей ---
+    # --- Оверлей ---
     if DEBUG_OVERLAY:
-        fps = 1.0 / max(current_time - prev_time, 1e-6)
-        cv2.putText(frame, f"FPS: {fps:5.1f}", (10, 30),
+        dt_frame = max(current_time - prev_time, 1e-6)
+        fps_now  = 1.0 / dt_frame
+        # Скользящее среднее для стабильности цифры
+        fps_smoothed = 0.9 * fps_smoothed + 0.1 * fps_now if fps_smoothed else fps_now
+
+        cv2.putText(frame, f"FPS: {fps_smoothed:5.1f}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         if is_dragging:
-            status = "DRAG"
+            status, color = "DRAG", (255, 0, 0)
         elif pinch_start_time is not None:
-            status = "HOLD"
+            status, color = "HOLD", (0, 255, 255)
         else:
-            status = "MOVE"
+            status, color = "MOVE", (200, 200, 200)
         cv2.putText(frame, status, (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        mode_bits = []
+        if USE_PALM_HYBRID:    mode_bits.append("PALM")
+        if USE_DEAD_ZONE:      mode_bits.append("DZ")
+        if PRECISION_ON_PINCH: mode_bits.append("PREC")
+        cv2.putText(frame, " ".join(mode_bits), (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+
     prev_time = current_time
 
     cv2.imshow('Mudra Drag & Drop', frame)
